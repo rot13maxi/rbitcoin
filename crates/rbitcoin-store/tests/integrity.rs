@@ -896,7 +896,9 @@ fn pruned_short_input_skips_the_witness_locator() {
         txstat: &s.txs.txstat,
         input: &s.txs.input,
     };
-    rbitcoin_store::tx_table::repair_class_a_count_skew(stems, true, true, 0).unwrap();
+    // Genesis is committed. Its fixture txid is zero, which open reads as a
+    // torn `txid.body` row past the floor.
+    rbitcoin_store::tx_table::repair_class_a_count_skew(stems, true, true, 1).unwrap();
     drop(disarm);
     assert_eq!(s.txs.count(), 1, "repair stops at the short input");
     assert_eq!(s.txs.input.count(), 1);
@@ -1492,6 +1494,13 @@ fn every_unsynced_archive_subset_reopens_at_the_sealed_tip() {
             if let Err(e) = s.txs.get_meta_and_outputs(Fk(fk)) {
                 panic!("dropped {dropped:?}: kept create {fk} does not decode: {e}");
             }
+            if fk > 1 {
+                assert_eq!(
+                    s.txs.body_txid(Fk(fk)).unwrap(),
+                    [(fk - 1) as u8; 32],
+                    "dropped {dropped:?}: kept create {fk} lost its txid"
+                );
+            }
         }
         connect_coinbase(&s, &write, 1, genesis, parent);
         assert_eq!(
@@ -1753,6 +1762,15 @@ fn torn_tombstones_reopen_and_finish_the_pad() {
             for fk in 1..=3 {
                 if let Err(e) = s.txs.get_meta_and_outputs(Fk(fk)) {
                     panic!("{case}: create {fk} does not decode: {e}");
+                }
+                if fk > 1 {
+                    let mut tombstone = [u8::MAX; 32];
+                    tombstone[24..].copy_from_slice(&fk.to_le_bytes());
+                    assert_eq!(
+                        s.txs.body_txid(Fk(fk)).unwrap(),
+                        tombstone,
+                        "{case}: tombstone {fk} lost its txid"
+                    );
                 }
             }
         }

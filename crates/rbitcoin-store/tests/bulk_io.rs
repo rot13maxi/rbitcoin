@@ -299,6 +299,18 @@ fn sync_batch_that_gives_up_keeps_its_failed_syncs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Only a submitted sync can have taken the writeback error. One the batch
+/// never pushed is left for the caller's one-at-a-time sync (`i32::MIN`),
+/// so a failed push does not latch the store without an IO error.
+#[test]
+fn abandoned_sync_batch_fails_only_what_it_submitted() {
+    let m = i32::MIN;
+    assert_eq!(
+        abandoned_sync_results(vec![0, -5, m, m, m], 3),
+        vec![0, -5, -5, m, m]
+    );
+}
+
 #[test]
 fn held_pread_errno_on_live_ring_is_ok_true() {
     let dir = std::env::temp_dir().join(format!(

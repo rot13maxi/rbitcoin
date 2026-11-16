@@ -1290,8 +1290,8 @@ impl TableFile {
     /// ([`crate::bulk_io::sync_data_batch`]): one io_uring submission, the
     /// shared pool's workers, or IOCP. The filesystem can then share journal
     /// commits and device cache flushes between them. With
-    /// `RBITCOIN_IO=pread`, or when the session fails before it submits a
-    /// sync, they run one after another.
+    /// `RBITCOIN_IO=pread`, or for a file the session never submitted, they
+    /// run one after another.
     pub fn sync_data_all(files: &[&TableFile]) -> Result<(), StoreError> {
         #[cfg(debug_assertions)]
         for f in files {
@@ -1306,19 +1306,23 @@ impl TableFile {
             }
         }
         let handles: Vec<_> = files.iter().map(|f| f.io_handle()).collect();
-        if let Some(res) = crate::bulk_io::sync_data_batch(&handles) {
-            return match files.iter().zip(res).find(|(_, r)| *r != 0) {
-                Some((f, r)) => Err(StoreError::io(
-                    &f.path,
-                    std::io::Error::from_raw_os_error(-r),
-                )),
-                None => Ok(()),
-            };
-        }
-        for f in files {
-            f.read_file
-                .sync_data()
-                .map_err(|e| StoreError::io(&f.path, e))?;
+        let res = crate::bulk_io::sync_data_batch(&handles)
+            .unwrap_or_else(|| vec![i32::MIN; files.len()]);
+        for (f, r) in files.iter().zip(res) {
+            match r {
+                0 => {}
+                // Never submitted: sync it here.
+                i32::MIN => f
+                    .read_file
+                    .sync_data()
+                    .map_err(|e| StoreError::io(&f.path, e))?,
+                r => {
+                    return Err(StoreError::io(
+                        &f.path,
+                        std::io::Error::from_raw_os_error(-r),
+                    ))
+                }
+            }
         }
         Ok(())
     }

@@ -572,7 +572,8 @@ pub fn pwrite_batch_on_session(
 ///
 /// A submitted sync may have taken the file description's writeback error,
 /// and a retry on the same fd then returns 0. So once one is submitted, a
-/// failed batch reports every result it did not see as EIO.
+/// failed batch reports every submitted sync it did not hear back from as
+/// EIO, and `i32::MIN` for one it never pushed (the caller syncs those).
 pub fn sync_data_batch(handles: &[IoHandle]) -> Option<Vec<i32>> {
     if handles.is_empty() {
         return Some(Vec::new());
@@ -641,22 +642,31 @@ pub fn sync_data_batch_on_session(
 }
 
 /// Drain a failed sync batch. Nothing submitted: `None`, the caller may
-/// sync one at a time. Otherwise every result not seen is EIO.
+/// sync one at a time. Otherwise see [`abandoned_sync_results`].
 fn sync_batch_abandoned(
     session: &mut crate::uring_session::UringSession,
-    mut res: Vec<i32>,
+    res: Vec<i32>,
     submitted: usize,
 ) -> Option<Vec<i32>> {
     let _ = session.drain_all();
     if submitted == 0 {
         return None;
     }
-    for r in &mut res {
+    Some(abandoned_sync_results(res, submitted))
+}
+
+/// Results of a sync batch that failed after `submitted` pushes (in index
+/// order). A submitted sync with no result is EIO: it may have taken the
+/// writeback error. One never pushed stays `i32::MIN`, for the caller to
+/// sync itself.
+#[doc(hidden)]
+pub fn abandoned_sync_results(mut res: Vec<i32>, submitted: usize) -> Vec<i32> {
+    for r in res.iter_mut().take(submitted) {
         if *r == i32::MIN {
             *r = -5;
         }
     }
-    Some(res)
+    res
 }
 
 /// Unfilled or failed pwrite ops are not success. Caller libc-retries.

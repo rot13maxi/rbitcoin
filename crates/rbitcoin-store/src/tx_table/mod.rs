@@ -1091,6 +1091,18 @@ fn create_decodes(
         },
         Err(e) => return torn(e),
     };
+    // A `txid.body` header can land without its rows: a zero txid has no
+    // SHA-256d preimage, so it is a row that never reached the device.
+    match stems.txids.get_read_at(fk) {
+        Ok(txid) if txid == [0u8; 32] => return Ok(false),
+        Ok(_) => {}
+        Err(StoreError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::UnexpectedEof =>
+        {
+            return Ok(false)
+        }
+        Err(e) => return torn(e),
+    }
     let outs = stems.body.with_bytes_at(pair.txout.0, pair.txout.1, |b| {
         decode_packed_tx_outs_with_spender_rels_secret(b, pair.n_out, None).map(|_| ())
     });
