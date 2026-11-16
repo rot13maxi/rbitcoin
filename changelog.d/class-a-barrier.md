@@ -32,6 +32,11 @@ Fixed
   temp file and renamed, with the directory synced. `store.secret` is
   created owner-only. A short mempool `meta` left by an older
   binary is moved aside like any other unreadable mempool image.
+- **Torn fee/size stats read as missing.** A power cut during a
+  `getblockstats` stamp could leave a stats cell naming an overflow record
+  that never landed. Every later `getblockstats` for that block then
+  failed with "txstat overflow missing". The row now reads as unstamped,
+  and the next call stamps it again.
 - **A torn address index rebuilds itself.** When the scripthash
   write-behind reads a torn record after a power cut, it marks the index
   for a full rebuild on the next start instead of failing every few

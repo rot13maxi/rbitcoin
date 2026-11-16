@@ -1502,6 +1502,9 @@ fn every_unsynced_archive_subset_reopens_at_the_sealed_tip() {
                     "dropped {dropped:?}: kept create {fk} lost its txid"
                 );
             }
+            if let Err(e) = s.txstat_row(Fk(fk)) {
+                panic!("dropped {dropped:?}: kept create {fk} stats: {e}");
+            }
         }
         connect_coinbase(&s, &write, 1, genesis, parent);
         assert_eq!(
@@ -1512,6 +1515,115 @@ fn every_unsynced_archive_subset_reopens_at_the_sealed_tip() {
         );
     }
     let _ = std::fs::remove_dir_all(&img);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A row big enough to need an overflow tail: fee, base, and witness ULEBs
+/// past the 8-byte cell.
+fn wide_txstat() -> rbitcoin_store::TxStatRow {
+    rbitcoin_store::TxStatRow {
+        fee_sat: u64::MAX >> 1,
+        base: u32::MAX,
+        wit_extra: 7,
+    }
+}
+
+/// A stats stamp after the barrier (`getblockstats` fills unstamped rows)
+/// writes the cells, then the overflow blob, then its slot in `txstat.blk`,
+/// with no sync until the next barrier. Power loss can keep any of them.
+/// Each image reopens and reads the row as unstamped or as the stamp, never
+/// an error, so the RPC falls back and restamps; the restamp reads back.
+#[test]
+fn every_torn_txstat_stamp_reads_unstamped_and_restamps() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    let (h1, _) = connect_coinbase(&s, &write, 1, genesis, parent);
+    assert_eq!(s.flush_class_c_tip().unwrap(), Some(Height(1)));
+    let fk = s.header_txs.get_list(h1).unwrap().unwrap()[0];
+    drop(s);
+    let sealed = store_image(&dir);
+    let wide = wide_txstat();
+    assert!(rbitcoin_store::txstat::pack_cell(&wide)
+        .unwrap()
+        .1
+        .is_some());
+    let s = Store::open_tiny(&dir).unwrap();
+    s.write_txstat_block(h1, fk.0, &[wide]).unwrap();
+    assert_eq!(s.txstat_row(fk).unwrap(), Some(wide), "control");
+    drop(s);
+    let stamped = store_image(&dir);
+    let changed: Vec<PathBuf> = stamped
+        .iter()
+        .filter(|(rel, bytes)| sealed.get(*rel) != Some(*bytes))
+        .filter(|(rel, _)| rel.to_string_lossy().starts_with("txstat."))
+        .map(|(rel, _)| rel.clone())
+        .collect();
+    assert_eq!(changed.len(), 3, "stamp writes: {changed:?}");
+    let header = rbitcoin_store::file::FILE_HEADER_LEN;
+    let mut cases: Vec<(u32, Option<usize>)> = (0..8).map(|mask| (mask, None)).collect();
+    cases.extend((0..3).map(|bit| (0, Some(bit))));
+    let img = tmp();
+    for (dropped, header_only) in cases {
+        let mut image = stamped.clone();
+        let mut case = Vec::new();
+        for (bit, rel) in changed.iter().enumerate() {
+            let old = sealed.get(rel).cloned().unwrap_or_default();
+            if header_only == Some(bit) {
+                let new = &stamped[rel];
+                let mut bytes = vec![0u8; new.len()];
+                let keep = old.len().min(new.len());
+                bytes[..keep].copy_from_slice(&old[..keep]);
+                let head = header.min(new.len());
+                bytes[..head].copy_from_slice(&new[..head]);
+                image.insert(rel.clone(), bytes);
+                case.push(format!("{} rows", rel.display()));
+            } else if dropped & (1 << bit) != 0 {
+                image.insert(rel.clone(), old);
+                case.push(rel.display().to_string());
+            }
+        }
+        write_image(&img, &image);
+        let s = Store::open_tiny(&img).unwrap_or_else(|e| panic!("lost {case:?}: open: {e}"));
+        let row = s
+            .txstat_row(fk)
+            .unwrap_or_else(|e| panic!("lost {case:?}: row read: {e}"));
+        assert!(row.is_none() || row == Some(wide), "lost {case:?}: {row:?}");
+        let range = s
+            .txstat_range(h1, fk.0, fk.0)
+            .unwrap_or_else(|e| panic!("lost {case:?}: range read: {e}"));
+        assert_eq!(range, vec![row], "lost {case:?}");
+        s.write_txstat_block(h1, fk.0, &[wide]).unwrap();
+        assert_eq!(
+            s.txstat_row(fk).unwrap(),
+            Some(wide),
+            "lost {case:?}: restamp"
+        );
+        assert_eq!(s.txstat_range(h1, fk.0, fk.0).unwrap(), vec![Some(wide)]);
+    }
+    let _ = std::fs::remove_dir_all(&img);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A create open keeps past the committed floor can carry a stamped cell
+/// whose tail was in a block that never committed. It has no confirmed
+/// height to find that tail by, so its row reads as unstamped.
+#[test]
+fn stamped_txstat_of_an_unconfirmed_create_reads_unstamped() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    let (rec, ins, outs) = coinbase(1);
+    let fk = s
+        .put_tx_full_batch_indexed(&[(rec, ins, outs)], false)
+        .unwrap()[0];
+    let (cell, tail) = rbitcoin_store::txstat::pack_cell(&wide_txstat()).unwrap();
+    assert!(tail.is_some());
+    let off = rbitcoin_store::txstat::TxStat::entry_offset(fk.0).unwrap();
+    s.txs.txstat.body.write_at_pwrite(off, &cell).unwrap();
+    assert_eq!(s.txstat_row(fk).unwrap(), None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

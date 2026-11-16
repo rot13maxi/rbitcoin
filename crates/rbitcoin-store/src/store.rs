@@ -989,7 +989,7 @@ impl Store {
         first: u64,
         last: u64,
     ) -> Result<Vec<Option<crate::TxStatRow>>, StoreError> {
-        let blob = self.txs.txstat.header_blob(header_fk)?;
+        let blob = self.txs.txstat.header_blob_or_empty(header_fk)?;
         self.txs.txstat.get_range(first, last, Some(&blob))
     }
 
@@ -1044,19 +1044,20 @@ impl Store {
         match crate::txstat::parse_cell(cell)? {
             crate::txstat::CellParse::Unstamped => Ok(None),
             crate::txstat::CellParse::Complete(row) => Ok(Some(row)),
+            // The tail is found through the create's confirmed block. A
+            // create open kept past the committed floor has none, and its
+            // tail may never have landed: it reads as unstamped.
             crate::txstat::CellParse::NeedTail => {
-                let h = self
-                    .tx_height_get(fk)?
-                    .ok_or(StoreError::Corrupt("invariant: txstat overflow missing"))?;
-                let hfk = self
-                    .confirmed
-                    .get(Height(h))?
-                    .ok_or(StoreError::Corrupt("invariant: txstat overflow missing"))?;
-                let (first, _) = self
-                    .header_txs
-                    .get_range(hfk)?
-                    .ok_or(StoreError::Corrupt("invariant: txstat overflow missing"))?;
-                let blob = self.txs.txstat.header_blob(hfk)?;
+                let Some(h) = self.tx_height_get(fk)? else {
+                    return Ok(None);
+                };
+                let Some(hfk) = self.confirmed.get(Height(h))? else {
+                    return Ok(None);
+                };
+                let Some((first, _)) = self.header_txs.get_range(hfk)? else {
+                    return Ok(None);
+                };
+                let blob = self.txs.txstat.header_blob_or_empty(hfk)?;
                 self.txs.txstat.get_row_merged(fk, first.0, &blob)
             }
         }

@@ -199,6 +199,18 @@ pub fn decode_ovf_blob(raw: &[u8]) -> Result<Vec<(u16, Vec<u8>)>, StoreError> {
     Ok(out)
 }
 
+/// A stamped cell completed by its overflow tail, or `None` when the tail is
+/// missing or does not complete it.
+///
+/// A stamp writes the cells, then the blob, then its `txstat.blk` slot, and
+/// none is synced until the next barrier. After a power cut a cell can name
+/// a tail that never landed. Stats are rebuilt from the block, so such a row
+/// is unstamped: readers fall back and `getblockstats` stamps it again.
+fn merge_tail(cell: [u8; 8], tails: &[(u16, Vec<u8>)], idx: u16) -> Option<TxStatRow> {
+    let rest = tail_for_index(tails, idx).ok()?;
+    parse_with_tail(cell, rest).ok()
+}
+
 #[doc(hidden)]
 pub fn tail_for_index(tails: &[(u16, Vec<u8>)], idx: u16) -> Result<&[u8], StoreError> {
     match tails.binary_search_by_key(&idx, |(i, _)| *i) {
@@ -384,14 +396,14 @@ impl TxStat {
             CellParse::Complete(row) => Ok(Some(row)),
             CellParse::NeedTail => {
                 let id = fk.get().ok_or(StoreError::InvalidFk)?;
-                if id < first_fk {
-                    return Err(StoreError::Corrupt("invariant: txstat overflow missing"));
-                }
-                let idx = u16::try_from(id - first_fk)
-                    .map_err(|_| StoreError::Corrupt("txstat overflow index"))?;
-                let tails = decode_ovf_blob(blob)?;
-                let rest = tail_for_index(&tails, idx)?;
-                Ok(Some(parse_with_tail(cell, rest)?))
+                let Some(idx) = id.checked_sub(first_fk).and_then(|i| u16::try_from(i).ok()) else {
+                    return Ok(None);
+                };
+                Ok(merge_tail(
+                    cell,
+                    &decode_ovf_blob(blob).unwrap_or_default(),
+                    idx,
+                ))
             }
         }
     }
@@ -423,7 +435,7 @@ impl TxStat {
             self.body.pread_at(off, &mut raw)?;
         }
         let tails = match blob {
-            Some(b) if !b.is_empty() => decode_ovf_blob(b)?,
+            Some(b) if !b.is_empty() => decode_ovf_blob(b).unwrap_or_default(),
             _ => Vec::new(),
         };
         let (cells, _) = raw.as_chunks::<{ TXSTAT_ENTRY_LEN as usize }>();
@@ -435,8 +447,7 @@ impl TxStat {
                 CellParse::NeedTail => {
                     let idx = u16::try_from(i)
                         .map_err(|_| StoreError::Corrupt("txstat overflow index"))?;
-                    let rest = tail_for_index(&tails, idx)?;
-                    out.push(Some(parse_with_tail(*cell, rest)?));
+                    out.push(merge_tail(*cell, &tails, idx));
                 }
             }
         }
@@ -574,6 +585,16 @@ impl TxStat {
         slot[12..16].copy_from_slice(&n.to_le_bytes());
         self.blk.write_at_pwrite(slot_off, &slot)?;
         Ok(())
+    }
+
+    /// [`Self::header_blob`] for a reader: a slot past the end of
+    /// `txstat.ovf` is a stamp whose blob never landed, and reads as no
+    /// blob. An IO error still fails.
+    pub fn header_blob_or_empty(&self, header_fk: Fk) -> Result<Vec<u8>, StoreError> {
+        match self.header_blob(header_fk) {
+            Err(StoreError::Corrupt(_)) => Ok(Vec::new()),
+            other => other,
+        }
     }
 
     pub fn header_blob(&self, header_fk: Fk) -> Result<Vec<u8>, StoreError> {
