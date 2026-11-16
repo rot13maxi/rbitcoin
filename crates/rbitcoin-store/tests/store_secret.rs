@@ -149,6 +149,29 @@ fn write_publishes_an_owner_only_secret_through_a_synced_rename() {
     );
 }
 
+/// A private temp file is owner-only from the moment it is opened, so no
+/// other local user can hold a readable fd on it. A stale world-readable
+/// temp from an earlier crash is replaced, not reused.
+#[cfg(unix)]
+#[test]
+fn private_temp_file_is_owner_only_when_opened() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir();
+    let path = dir.path().join("store.secret");
+    let tmp = rbitcoin_store::file::tmp_sidecar_path(&path);
+    std::fs::write(&tmp, b"stale").unwrap();
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+    rbitcoin_store::file::write_private_synced_tmp_file(&path, |f| {
+        let mode = f.metadata().unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "temp opened readable by others");
+        f.write_all(b"secret").unwrap();
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"secret");
+}
+
 /// Store `meta` is the create commit. Its name is synced like the rewrite.
 #[test]
 fn store_meta_is_published_through_a_synced_rename() {

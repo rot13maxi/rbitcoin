@@ -687,9 +687,12 @@ pub struct TxTable {
     pub datadir_hdd: std::sync::atomic::AtomicBool,
     /// Historical spend slots not yet folded into `spent.body`.
     spend_pages: crate::spend_page_log::SpendPageLog,
-    /// A Class A `sync_data` failed. The kernel may have dropped those dirty
-    /// pages, so a retry that succeeds proves nothing; refuse until restart.
-    class_a_sync_failed: std::sync::atomic::AtomicBool,
+    /// Held across every Class A sync; `true` once one failed. The kernel
+    /// may have dropped those dirty pages, so a retry that succeeds proves
+    /// nothing; refuse until restart. One sync at a time, so a sync that
+    /// returns 0 because another took the writeback error cannot commit
+    /// after that failure.
+    class_a_sync_failed: std::sync::Mutex<bool>,
     /// Per-fk packed `txout` decodes for an outs reader
     /// ([`Self::get_meta_and_outputs`], and [`Self::get`] through it), the
     /// decode the mempool and block-proposal pins count. [`Self::get_full`] is
@@ -1321,7 +1324,7 @@ impl TxTable {
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(false),
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
             spend_pages: crate::spend_page_log::SpendPageLog::create(dir),
-            class_a_sync_failed: std::sync::atomic::AtomicBool::new(false),
+            class_a_sync_failed: std::sync::Mutex::new(false),
         })
     }
 
@@ -1565,7 +1568,7 @@ impl TxTable {
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(prune_seqsigwit_mode),
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
             spend_pages: crate::spend_page_log::SpendPageLog::load_clipped(dir, spent_body_end)?,
-            class_a_sync_failed: std::sync::atomic::AtomicBool::new(false),
+            class_a_sync_failed: std::sync::Mutex::new(false),
         };
         match input_open_tail(t.input.count(), n_bodies, t.seqsigwit.count()) {
             InputOpenTail::Backfill { from } => {
@@ -2830,8 +2833,15 @@ impl TxTable {
         // sample. Confirm can publish a longer end in between.
         self.spend_pages.copy_cooled(
             |off, image| self.spent.write_body_pwrite(off, image),
-            || self.spent.sync_data_only(),
+            || self.sync_folded_spent(),
         )
+    }
+
+    /// The fold's `spent.body` sync. It shares the barrier's fd, so it runs
+    /// under the Class A latch.
+    #[doc(hidden)]
+    pub fn sync_folded_spent(&self) -> Result<(), StoreError> {
+        self.class_a_latched(|| self.spent.sync_data_only())
     }
 
     pub(crate) fn finish_cooled_spend_pages(&self) -> Result<(), StoreError> {
@@ -3989,19 +3999,30 @@ impl TxTable {
     /// Does not publish high-water marks; headers already written are in
     /// the file and land with it.
     ///
-    /// A failure latches: every later call refuses until restart.
+    /// A failure latches: every later call refuses until restart. Calls run
+    /// one at a time (the tip barrier and the spend checkpoint can overlap).
     pub fn sync_class_a_data(&self) -> Result<(), StoreError> {
-        use std::sync::atomic::Ordering;
-        if self.class_a_sync_failed.load(Ordering::Acquire) {
+        self.class_a_latched(|| self.sync_class_a_stems())
+    }
+
+    /// Run `sync` on Class A fds under the latch: refuse once one failed,
+    /// one at a time, and latch a failure.
+    fn class_a_latched(
+        &self,
+        sync: impl FnOnce() -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let mut failed = self
+            .class_a_sync_failed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *failed {
             return Err(StoreError::io(
                 self.body.body.path(),
                 std::io::Error::other("an earlier Class A sync failed; restart the node"),
             ));
         }
-        let synced = self.sync_class_a_stems();
-        if synced.is_err() {
-            self.class_a_sync_failed.store(true, Ordering::Release);
-        }
+        let synced = sync();
+        *failed = synced.is_err();
         synced
     }
 

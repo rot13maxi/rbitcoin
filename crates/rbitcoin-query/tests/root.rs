@@ -1003,6 +1003,29 @@ fn recover_sh_writebehind_fails_open_on_interior_missing_header_txs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The clear flushes every dirty `header_txs` row, including another
+/// block's range whose creates are not synced yet. It runs the Class A sync
+/// first, like every other `header_txs` flush.
+#[test]
+fn clear_archived_body_syncs_class_a_before_header_txs() {
+    let (dir, q) = temp_query("clear-syncs-class-a");
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let hash0 = h0.hash;
+    q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    let prev0 = q.tip_header_fk().unwrap().unwrap();
+    let (h1, t1) = coinbase_block(1, prev0, Some(hash0));
+    q.commit_class_a_only(&h1, &[t1]).unwrap();
+    let body = q.store().txs.body.body.io_handle();
+    rbitcoin_store::io_handle::arm_fail_sync(body, 1);
+    let cleared = q.clear_archived_body_here(&hash0);
+    rbitcoin_store::io_handle::disarm_sync(body);
+    assert!(
+        cleared.is_err(),
+        "header_txs reached disk without the Class A sync"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn clear_archived_body_waits_for_the_confirm_write_channel() {
     let (dir, q) = temp_query("clear-on-write-channel");

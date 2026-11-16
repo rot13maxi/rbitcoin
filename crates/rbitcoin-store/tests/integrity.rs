@@ -1284,6 +1284,60 @@ fn class_a_sync_failure_stops_the_class_c_commit() {
     }
 }
 
+/// A barrier in flight when another caller's Class A sync fails must not
+/// commit after it. The failed fsync took the writeback error for the shared
+/// file description, so the in-flight one can return 0 over dropped pages.
+/// The tip barrier and the spend checkpoint can run together.
+#[test]
+fn class_a_sync_in_flight_does_not_pass_a_latched_failure() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    let done = AtomicUsize::new(0);
+    // The pre-check walks the files in order: hold the first caller on the
+    // last one, and fail the second on the first, which the first has passed.
+    let last = CLASS_A_FILES[CLASS_A_FILES.len() - 1].1(&s);
+    let first = CLASS_A_FILES[0].1(&s);
+    rbitcoin_store::io_handle::arm_sync_delay(last, std::time::Duration::from_millis(400));
+    let ((a_ok, a_at), (b_ok, b_at)) = std::thread::scope(|sc| {
+        let a = sc.spawn(|| {
+            let ok = s.txs.sync_class_a_data().is_ok();
+            (ok, done.fetch_add(1, Ordering::SeqCst))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        rbitcoin_store::io_handle::arm_fail_sync(first, 1);
+        let ok = s.txs.sync_class_a_data().is_ok();
+        let b = (ok, done.fetch_add(1, Ordering::SeqCst));
+        (a.join().unwrap(), b)
+    });
+    assert!(!b_ok, "the armed sync did not fail");
+    assert!(
+        !(a_ok && a_at > b_at),
+        "a barrier committed after another latched a failed sync"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The spend fold syncs `spent.body` on the fd the barrier syncs. If that
+/// sync fails it may have taken the writeback error, so the Class A latch
+/// closes: a later barrier sync on the fd can return 0.
+#[test]
+fn failed_fold_sync_latches_class_a() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let spent = s.txs.spent.body.io_handle();
+    rbitcoin_store::io_handle::arm_fail_sync(spent, 1);
+    assert!(s.txs.sync_folded_spent().is_err());
+    rbitcoin_store::io_handle::disarm_sync(spent);
+    assert!(
+        s.txs.sync_class_a_data().is_err(),
+        "a Class A sync passed after the fold's sync of the same fd failed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 type ClassAPick = fn(&Store) -> rbitcoin_store::io_handle::IoHandle;
 
 /// Every Class A file the barrier syncs.
@@ -1645,5 +1699,64 @@ fn pad_target_survives_a_crash_before_the_tombstones() {
     assert_eq!(s.txs.count(), 3);
     assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
     assert!(!dir.join("class_a.pad").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Power loss during the pad, after the tombstones were written and before
+/// their sync. Each archive file the pad wrote is lost, or keeps its header
+/// page without the rows behind it. Open checks every tombstone, finishes
+/// the pad, and removes its target; every create decodes.
+#[test]
+fn torn_tombstones_reopen_and_finish_the_pad() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    s.flush_class_c_tip().unwrap();
+    drop(s);
+    let sealed = store_image(&dir);
+    std::fs::write(dir.join("class_a.pad"), 3u64.to_le_bytes()).unwrap();
+    drop(Store::open_tiny(&dir).unwrap());
+    let mut padded = store_image(&dir);
+    padded.insert(PathBuf::from("class_a.pad"), 3u64.to_le_bytes().to_vec());
+    let changed: Vec<PathBuf> = padded
+        .iter()
+        .filter(|(rel, bytes)| sealed.get(*rel) != Some(*bytes))
+        .filter(|(rel, _)| !rel.starts_with("tx.head") && *rel != "class_a.pad")
+        .map(|(rel, _)| rel.clone())
+        .collect();
+    assert!(changed.len() >= 8, "archive files written: {changed:?}");
+    let header = rbitcoin_store::file::FILE_HEADER_LEN;
+    let img = tmp();
+    for rel in &changed {
+        for header_only in [false, true] {
+            let mut image = padded.clone();
+            let old = sealed.get(rel).cloned().unwrap_or_default();
+            if header_only {
+                let new = &padded[rel];
+                let mut bytes = vec![0u8; new.len()];
+                let keep = old.len().min(new.len());
+                bytes[..keep].copy_from_slice(&old[..keep]);
+                let head = header.min(new.len());
+                bytes[..head].copy_from_slice(&new[..head]);
+                image.insert(rel.clone(), bytes);
+            } else if sealed.contains_key(rel) {
+                image.insert(rel.clone(), old);
+            } else {
+                image.remove(rel);
+            }
+            let case = format!("{} header_only={header_only}", rel.display());
+            write_image(&img, &image);
+            let s = Store::open_tiny(&img).unwrap_or_else(|e| panic!("{case}: open failed: {e}"));
+            assert_eq!(s.txs.count(), 3, "{case}");
+            assert!(!img.join("class_a.pad").exists(), "{case}: pad left");
+            for fk in 1..=3 {
+                if let Err(e) = s.txs.get_meta_and_outputs(Fk(fk)) {
+                    panic!("{case}: create {fk} does not decode: {e}");
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&img);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -565,8 +565,10 @@ impl Store {
         if layout.is_split() {
             refuse_cold_index_dirs(&path, &seqsigwit_dir)?;
         }
-        let committed =
-            committed_create_count(&header_txs)?.max(crate::integrity::read_pad_target(&path)?);
+        // The pad clears `header_txs` past its floor before any tombstone, so
+        // every tombstone sits above `committed` and open decodes it.
+        let committed = committed_create_count(&header_txs)?;
+        let pad_target = crate::integrity::read_pad_target(&path)?;
         let txs = TxTable::open_seqsigwit(&path, &seqsigwit_dir, layout.open_opts(), committed)?;
         if layout.is_split() {
             write_seqsigwit_reloc(&path)?;
@@ -594,7 +596,7 @@ impl Store {
             cold_path,
             head_scale: layout.head_scale,
         };
-        store.drop_confirmed_past_creates(committed)?;
+        store.drop_confirmed_past_creates(committed, pad_target)?;
         store.rebuild_mtp_ring()?;
         Ok(store)
     }

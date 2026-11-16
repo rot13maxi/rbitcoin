@@ -30,7 +30,7 @@ Fixed
 - **Small state files are published whole.** Store `meta`, `store.secret`,
   the mempool `meta`, and the unbroadcast list are written to a synced
   temp file and renamed, with the directory synced. `store.secret` is
-  owner-only before its first byte. A short mempool `meta` left by an older
+  created owner-only. A short mempool `meta` left by an older
   binary is moved aside like any other unreadable mempool image.
 - **A torn address index rebuilds itself.** When the scripthash
   write-behind reads a torn record after a power cut, it marks the index

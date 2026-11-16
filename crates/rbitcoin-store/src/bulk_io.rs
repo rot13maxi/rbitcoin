@@ -567,8 +567,12 @@ pub fn pwrite_batch_on_session(
 /// or IOCP (which flushes inline). Returns each handle's 0 or negated errno.
 ///
 /// `None` when no session runs (`RBITCOIN_IO=pread`, or it did not open)
-/// or the batch failed before every result came back; the caller syncs one
-/// at a time.
+/// or the batch failed before it submitted a sync; the caller syncs one at
+/// a time.
+///
+/// A submitted sync may have taken the file description's writeback error,
+/// and a retry on the same fd then returns 0. So once one is submitted, a
+/// failed batch reports every result it did not see as EIO.
 pub fn sync_data_batch(handles: &[IoHandle]) -> Option<Vec<i32>> {
     if handles.is_empty() {
         return Some(Vec::new());
@@ -579,7 +583,8 @@ pub fn sync_data_batch(handles: &[IoHandle]) -> Option<Vec<i32>> {
     with_bulk_session(|session| sync_data_batch_on_session(session, handles)).flatten()
 }
 
-fn sync_data_batch_on_session(
+#[doc(hidden)]
+pub fn sync_data_batch_on_session(
     session: &mut crate::uring_session::UringSession,
     handles: &[IoHandle],
 ) -> Option<Vec<i32>> {
@@ -595,8 +600,7 @@ fn sync_data_batch_on_session(
             let ud = pack_ud(KIND_BULK_FSYNC, epoch, next as u32);
             if session.push_sync_data(handles[next], ud).is_err() {
                 if session.in_flight() == 0 {
-                    let _ = session.drain_all();
-                    return None;
+                    return sync_batch_abandoned(session, res, next);
                 }
                 break;
             }
@@ -610,16 +614,14 @@ fn sync_data_batch_on_session(
         let cqes = match session.harvest_ready() {
             Ok(c) => c,
             Err(_) => {
-                let _ = session.drain_all();
-                return None;
+                return sync_batch_abandoned(session, res, next);
             }
         };
         if cqes.is_empty() {
             match empty_harvest_next(session.submit_and_wait_one().is_ok()) {
                 EmptyHarvest::Retry => continue,
                 EmptyHarvest::Fail => {
-                    let _ = session.drain_all();
-                    return None;
+                    return sync_batch_abandoned(session, res, next);
                 }
             }
         }
@@ -628,14 +630,32 @@ fn sync_data_batch_on_session(
             let i = slot as usize;
             if kind != KIND_BULK_FSYNC || ep != epoch || i >= n || res[i] != i32::MIN {
                 session.poison();
-                let _ = session.drain_all();
-                return None;
+                return sync_batch_abandoned(session, res, next);
             }
             res[i] = r;
             completed += 1;
         }
     }
-    session.drain_all().ok()?;
+    let _ = session.drain_all();
+    Some(res)
+}
+
+/// Drain a failed sync batch. Nothing submitted: `None`, the caller may
+/// sync one at a time. Otherwise every result not seen is EIO.
+fn sync_batch_abandoned(
+    session: &mut crate::uring_session::UringSession,
+    mut res: Vec<i32>,
+    submitted: usize,
+) -> Option<Vec<i32>> {
+    let _ = session.drain_all();
+    if submitted == 0 {
+        return None;
+    }
+    for r in &mut res {
+        if *r == i32::MIN {
+            *r = -5;
+        }
+    }
     Some(res)
 }
 

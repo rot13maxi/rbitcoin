@@ -681,22 +681,33 @@ impl Store {
 
     /// After open fits Class A, drop confirmed heights it no longer covers.
     ///
-    /// `committed` is the highest create a durable Class C row (or an
-    /// unfinished pad) names. For writes by this binary the fit never cuts
-    /// below it. An older binary could: then the tip shrinks to the creates
-    /// that remain, and the cut numbers `(covered, committed]` are padded
-    /// with tombstones that are never strong, so a stale spend or posting
-    /// that names one never counts and no later transaction takes it.
+    /// `committed` is the highest create a durable Class C row names, and
+    /// `pad_target` the one an unfinished pad must reach (0 for none). For
+    /// writes by this binary the fit never cuts below `committed`. An older
+    /// binary could: then the tip shrinks to the creates that remain, and
+    /// the cut numbers `(covered, committed]` are padded with tombstones that
+    /// are never strong, so a stale spend or posting that names one never
+    /// counts and no later transaction takes it.
     ///
     /// Order: tip shrink, pad target ([`CLASS_A_PAD_NAME`]), `header_txs`
-    /// clear, tombstones, Class A sync, then the target is removed. A crash
-    /// at any step reopens with the same target and finishes it. Trailing
-    /// nulls, a header-only tip, and a Class C fixture keep the old shrink.
-    pub(crate) fn drop_confirmed_past_creates(&self, committed: u64) -> Result<(), StoreError> {
+    /// clear, tombstones, Class A sync, then the target is removed. The
+    /// clear lands before any tombstone, so open decodes every tombstone and
+    /// cuts a torn one. A crash at any step reopens with the same target and
+    /// finishes it. Trailing nulls, a header-only tip, and a Class C fixture
+    /// keep the old shrink.
+    pub(crate) fn drop_confirmed_past_creates(
+        &self,
+        committed: u64,
+        pad_target: u64,
+    ) -> Result<(), StoreError> {
         let covered = self.txs.count();
         let archive = covered != 0 || self.txs.bodies_allocated_past_header();
+        let committed = committed.max(pad_target);
         if committed > covered && archive {
             return self.pad_cut_creates(covered, committed);
+        }
+        if pad_target != 0 {
+            self.finish_pad()?;
         }
         let Some(tip) = self.confirmed.tip_height() else {
             return Ok(());
@@ -749,7 +760,13 @@ impl Store {
         for chunk in tombstones.chunks(4096) {
             self.txs.put_full_batch_indexed(chunk, true)?;
         }
+        self.finish_pad()
+    }
+
+    /// Every tombstone is written: sync them, then drop the pad target.
+    fn finish_pad(&self) -> Result<(), StoreError> {
         self.txs.sync_class_a_data()?;
+        let pad = self.path().join(CLASS_A_PAD_NAME);
         std::fs::remove_file(&pad).map_err(|e| StoreError::io(&pad, e))?;
         crate::file::fsync_parent_dir(self.path()).map_err(|e| StoreError::io(self.path(), e))
     }

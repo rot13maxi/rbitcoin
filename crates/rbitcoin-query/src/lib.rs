@@ -3169,7 +3169,9 @@ impl Query {
         let write = rbitcoin_store::ClassCWrite::new();
         let cleared = self.store.header_txs.clear_body(&write, fk)?;
         if cleared {
-            self.store.header_txs.flush()?;
+            // The flush writes every dirty range, not just this one: sync
+            // the creates they name first.
+            self.store.flush_header_archive()?;
         }
         Ok(cleared)
     }

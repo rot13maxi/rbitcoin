@@ -40,3 +40,6 @@ apilog*.jsonl
 
 # cargo mutants output
 mutants.out/
+
+# Python bytecode
+__pycache__/

@@ -60,8 +60,8 @@ impl StoreSecret {
 
     /// Persist under `store_dir/store.secret` by a synced rename.
     ///
-    /// The temp file is owner-only before the first byte lands. An existing
-    /// secret is never replaced.
+    /// The temp file is created owner-only. An existing secret is never
+    /// replaced.
     pub fn write_to_store_dir(&self, store_dir: &Path) -> Result<(), StoreError> {
         let path = secret_path(store_dir);
         if path.exists() {
@@ -70,13 +70,7 @@ impl StoreSecret {
                 std::io::Error::from(std::io::ErrorKind::AlreadyExists),
             ));
         }
-        crate::file::write_synced_tmp_file(&path, |f| {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                f.set_permissions(std::fs::Permissions::from_mode(0o600))
-                    .map_err(|e| StoreError::io(&path, e))?;
-            }
+        crate::file::write_private_synced_tmp_file(&path, |f| {
             f.write_all(&self.bytes)
                 .map_err(|e| StoreError::io(&path, e))
         })
