@@ -1292,32 +1292,33 @@ fn class_a_sync_failure_stops_the_class_c_commit() {
 /// The tip barrier and the spend checkpoint can run together.
 #[test]
 fn class_a_sync_in_flight_does_not_pass_a_latched_failure() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
     let dir = tmp();
     let s = Store::create_tiny(&dir).unwrap();
     let write = rbitcoin_store::ClassCWrite::for_test();
     connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
-    let done = AtomicUsize::new(0);
     // The pre-check walks the files in order: hold the first caller on the
     // last one, and fail the second on the first, which the first has passed.
     let last = CLASS_A_FILES[CLASS_A_FILES.len() - 1].1(&s);
     let first = CLASS_A_FILES[0].1(&s);
-    rbitcoin_store::io_handle::arm_sync_delay(last, std::time::Duration::from_millis(400));
-    let ((a_ok, a_at), (b_ok, b_at)) = std::thread::scope(|sc| {
-        let a = sc.spawn(|| {
-            let ok = s.txs.sync_class_a_data().is_ok();
-            (ok, done.fetch_add(1, Ordering::SeqCst))
-        });
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    let hold = Duration::from_millis(400);
+    let start = Instant::now();
+    rbitcoin_store::io_handle::arm_sync_delay(last, hold);
+    let (a_ok, b_ok, b_done) = std::thread::scope(|sc| {
+        let a = sc.spawn(|| s.txs.sync_class_a_data().is_ok());
+        std::thread::sleep(Duration::from_millis(100));
         rbitcoin_store::io_handle::arm_fail_sync(first, 1);
-        let ok = s.txs.sync_class_a_data().is_ok();
-        let b = (ok, done.fetch_add(1, Ordering::SeqCst));
-        (a.join().unwrap(), b)
+        let b_ok = s.txs.sync_class_a_data().is_ok();
+        let b_done = start.elapsed();
+        (a.join().unwrap(), b_ok, b_done)
     });
     assert!(!b_ok, "the armed sync did not fail");
+    // A succeeded only if its sync ran before the failure: the failing
+    // caller then returned after A's held sync, not during it. (If A started
+    // late, the failure latched first and A refused.)
     assert!(
-        !(a_ok && a_at > b_at),
-        "a barrier committed after another latched a failed sync"
+        !a_ok || b_done >= hold,
+        "a sync in flight succeeded while another failed beside it ({b_done:?})"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
